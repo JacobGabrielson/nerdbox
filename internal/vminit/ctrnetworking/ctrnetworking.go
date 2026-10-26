@@ -30,6 +30,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/containerd/log"
 	"github.com/vishvananda/netlink"
@@ -135,15 +136,10 @@ func makeNet(n nwcfg.Network) (netConfig, error) {
 		}
 	}
 
-	// Create the bridge if it doesn't already exist.
+	// Each container repeats the setup, finishing any move an earlier one left undone.
 	bridgeName := bridgeNameFromMAC(n.VmMAC)
-	if _, err := netlink.LinkByName(bridgeName); err != nil {
-		if !errors.As(err, &netlink.LinkNotFoundError{}) {
-			return netConfig{}, fmt.Errorf("checking for bridge %s: %w", bridgeName, err)
-		}
-		if err := addBridgeNetwork(n.VmMAC, bridgeName); err != nil {
-			return netConfig{}, err
-		}
+	if err := addBridgeNetwork(n.VmMAC, bridgeName); err != nil {
+		return netConfig{}, err
 	}
 
 	return netConfig{
@@ -155,16 +151,20 @@ func makeNet(n nwcfg.Network) (netConfig, error) {
 	}, nil
 }
 
-// addBridgeNetwork adds a bridge device and connects hostIf to it.
+// addBridgeNetwork puts hostIf on its bridge, which takes hostIf's MAC,
+// addresses and routes: a bridge port's own addresses lose neighbor resolution.
 func addBridgeNetwork(vmMAC string, bridgeName string) error {
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+
 	hostIf, err := linkByMAC(nil, vmMAC)
 	if err != nil {
 		return fmt.Errorf("getting host link: %w", err)
 	}
-	if err := netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}); err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			return nil
-		}
+	if err := netlink.LinkAdd(&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{
+		Name:         bridgeName,
+		HardwareAddr: hostIf.Attrs().HardwareAddr,
+	}}); err != nil && !errors.Is(err, unix.EEXIST) {
 		return fmt.Errorf("adding bridge %s: %w", bridgeName, err)
 	}
 	if err := netlink.LinkSetMaster(hostIf, &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: bridgeName}}); err != nil {
@@ -176,6 +176,72 @@ func addBridgeNetwork(vmMAC string, bridgeName string) error {
 	}
 	if err := netlink.LinkSetUp(br); err != nil {
 		return fmt.Errorf("set bridge %s 'up': %w", bridgeName, err)
+	}
+	if err := moveAddrs(&netlink.Handle{}, hostIf, br); err != nil {
+		return fmt.Errorf("moving %s's addresses to bridge %s: %w", hostIf.Attrs().Name, bridgeName, err)
+	}
+	return nil
+}
+
+// bridgeMu serializes bridge setup: containers on one VM card connect concurrently.
+var bridgeMu sync.Mutex
+
+// addrRouter is the part of a netlink handle that moves addresses and routes.
+type addrRouter interface {
+	AddrList(link netlink.Link, family int) ([]netlink.Addr, error)
+	AddrReplace(link netlink.Link, addr *netlink.Addr) error
+	AddrDel(link netlink.Link, addr *netlink.Addr) error
+	RouteList(link netlink.Link, family int) ([]netlink.Route, error)
+	RouteReplace(route *netlink.Route) error
+}
+
+// moveAddrs moves from's global addresses, and its routes other than their
+// prefix routes, to to. A move that fails partway is rolled back.
+func moveAddrs(nlh addrRouter, from, to netlink.Link) (retErr error) {
+	addrs, err := nlh.AddrList(from, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("listing addresses: %w", err)
+	}
+	addrs = slices.DeleteFunc(addrs, func(addr netlink.Addr) bool { return addr.Scope != unix.RT_SCOPE_UNIVERSE })
+	routes, err := nlh.RouteList(from, netlink.FAMILY_ALL)
+	if err != nil {
+		return fmt.Errorf("listing routes: %w", err)
+	}
+	routes = slices.DeleteFunc(routes, func(route netlink.Route) bool { return route.Protocol == unix.RTPROT_KERNEL })
+
+	var undo []func() error
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		for _, step := range slices.Backward(undo) {
+			if err := step(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("rolling back: %w", err))
+			}
+		}
+	}()
+
+	for _, addr := range addrs {
+		moved := &netlink.Addr{IPNet: addr.IPNet, Flags: addr.Flags}
+		if err := nlh.AddrReplace(to, moved); err != nil {
+			return fmt.Errorf("adding %s: %w", addr.IPNet, err)
+		}
+		undo = append(undo, func() error { return nlh.AddrDel(to, moved) })
+	}
+	// Routes move before the addresses go: deleting the last IPv4 address flushes from's routes.
+	for _, route := range routes {
+		moved := route
+		moved.LinkIndex = to.Attrs().Index
+		if err := nlh.RouteReplace(&moved); err != nil {
+			return fmt.Errorf("moving route %s: %w", route, err)
+		}
+		undo = append(undo, func() error { return nlh.RouteReplace(&route) })
+	}
+	for _, addr := range addrs {
+		if err := nlh.AddrDel(from, &addr); err != nil {
+			return fmt.Errorf("deleting %s: %w", addr.IPNet, err)
+		}
+		undo = append(undo, func() error { return nlh.AddrReplace(from, &addr) })
 	}
 	return nil
 }
@@ -275,8 +341,9 @@ func linkByMAC(nlh *netlink.Handle, mac string) (netlink.Link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("listing links: %w", err)
 	}
+	// The VM card's bridge carries the card's MAC, so it never matches.
 	idx := slices.IndexFunc(links, func(link netlink.Link) bool {
-		return link.Attrs().HardwareAddr.String() == mac
+		return link.Type() != "bridge" && link.Attrs().HardwareAddr.String() == mac
 	})
 	if idx == -1 {
 		return nil, fmt.Errorf("interface with MAC %s not found", mac)
